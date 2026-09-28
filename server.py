@@ -222,9 +222,42 @@ async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
 _pdf_cache: dict[str, tuple[float, bytes]] = {}
 
 
+def _parse_attach_url(url: str) -> tuple[str, str]:
+    """Estrae db e id da un URL 'verbo=attach&db=...&id=...'."""
+    import urllib.parse as up
+
+    qs = up.parse_qs(up.urlsplit(url).query)
+    db = qs.get("db", [None])[0]
+    doc_id = qs.get("id", [None])[0]
+    if not db or not doc_id:
+        raise RuntimeError("URL del PDF non riconosciuto (parametri db/id mancanti).")
+    return db, doc_id
+
+
+async def _prep_document(db: str, doc_id: str) -> None:
+    """Passo 1 del flusso reale del sito: chiama l'endpoint che genera la
+    versione OCR 'pulita' del PDF (risponde solo 'done'). Senza questa
+    chiamata preliminare, il download del PDF fallisce con un errore 500 —
+    è un comportamento del sito, non un problema di sessione o Referer."""
+    import urllib.parse as up
+
+    doc_param = f"/xway/application/nif/clean/hc.dll?verbo=attach&db={db}&id={doc_id}"
+    encoded = up.quote(doc_param, safe="")
+    prep_url = f"{config.BASE}/xway/application/nif/isapishare/hc.dll?app.document={encoded}"
+
+    client = await get_client()
+    async with _lock:
+        await _throttle()
+        try:
+            await client.get(prep_url, headers={"Referer": config.SEARCH_PAGE_URL})
+        except httpx.HTTPError:
+            pass  # non bloccante: proviamo comunque il download vero e proprio
+
+
 async def fetch_pdf_bytes(url: str) -> bytes:
-    """Scarica il PDF di un provvedimento con gli stessi header (sessione +
-    Referer) che il sito richiede. Una richiesta diretta senza questi header
+    """Scarica il PDF di un provvedimento replicando il flusso in due passi
+    del sito (preparazione + attach), con gli stessi header (sessione +
+    Referer) che il sito richiede. Una richiesta diretta senza questo flusso
     (es. incollare l'URL nel browser) fallisce con un errore del server."""
     now = time.monotonic()
     if url in _pdf_cache:
@@ -233,6 +266,9 @@ async def fetch_pdf_bytes(url: str) -> bytes:
             return data
 
     await ensure_session()
+    db, doc_id = _parse_attach_url(url)
+    await _prep_document(db, doc_id)
+
     client = await get_client()
     async with _lock:
         await _throttle()
@@ -270,20 +306,33 @@ def _extract_pdf_text(data: bytes, max_chars: int) -> tuple[str, bool]:
     return text, truncated
 
 
+def _clean_path(raw: str) -> str:
+    """Il sito serve solo la versione OCR 'pulita' del PDF, il cui nome è
+    quello grezzo con '.clean' inserito prima dell'estensione finale
+    (es. '...tO.pdf' -> '...tO.clean.pdf'). Se è già presente 'clean' nel
+    nome (a volte la ricerca lo restituisce già così) lo lasciamo invariato."""
+    if "clean" in raw.lower():
+        return raw
+    if raw.endswith(".pdf"):
+        return raw[:-4] + ".clean.pdf"
+    return raw + ".clean.pdf"
+
+
 def _pdf_url(doc: dict) -> Optional[str]:
     filename = doc.get("filename")
     kind = doc.get("kind")
     if not filename or not kind:
         return None
     # Il campo "filename" può essere una lista di percorsi (es. originale +
-    # versione OCR "pulita"): preferiamo quello con ".clean.pdf" se presente,
-    # altrimenti il primo disponibile.
+    # eventuale versione già 'pulita'): preferiamo quello con "clean" se
+    # presente, altrimenti il primo disponibile (poi normalizzato).
     if isinstance(filename, list):
         if not filename:
             return None
-        path = next((p for p in filename if "clean" in p), filename[0])
+        path = next((p for p in filename if "clean" in p.lower()), filename[0])
     else:
         path = filename
+    path = _clean_path(path)
     return config.PDF_URL_TEMPLATE.format(db=kind, path=path)
 
 
