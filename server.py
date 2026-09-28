@@ -33,6 +33,12 @@ Usa `cerca_cassazione` per ricerche testuali (anche con più parole: vengono
 cercate come prossimità, non richiede virgolette). Usa `ultime_cassazione`
 per gli ultimi provvedimenti pubblicati, senza una query specifica.
 
+PAGINAZIONE: ogni risultato riporta "totale_trovati" e "totale_pagine". Se
+devi fare una ricerca completa/esaustiva su un tema (non solo "qualche
+esempio"), non fermarti alla prima pagina: richiama lo stesso strumento con
+pagina=2, pagina=3, ecc. finché pagina < totale_pagine, rispettando comunque
+i tempi di attesa del sito tra una chiamata e l'altra.
+
 Ogni risultato include gli estremi del provvedimento, un estratto con i
 termini di ricerca evidenziati, e il link al PDF integrale (versione OCR
 "pulita"): il testo integrale va sempre letto lì, l'estratto è solo un
@@ -163,9 +169,10 @@ def build_query(query: str, tipo: str, sezione: Optional[str],
     return " AND ".join(f"({c})" for c in clauses)
 
 
-async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
+async def fetch_solr(q: str, rows: int, start: int = 0, _attempt: int = 0) -> dict:
     rows = max(1, min(rows, config.MAX_ROWS))
-    cache_key = f"{q}|{rows}"
+    start = max(0, start)
+    cache_key = f"{q}|{rows}|{start}"
     now = time.monotonic()
     if cache_key in _cache:
         ts, data = _cache[cache_key]
@@ -175,7 +182,7 @@ async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
     await ensure_session()
 
     data = {
-        "start": "0",
+        "start": str(start),
         "rows": str(rows),
         "q": q,
         "wt": "json",
@@ -202,7 +209,7 @@ async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
     if config.RATE_OVERFLOW_MARKER in text:
         if _attempt < config.MAX_RETRIES_ON_OVERFLOW:
             await asyncio.sleep(config.RETRY_BACKOFF * (_attempt + 1))
-            return await fetch_solr(q, rows, _attempt + 1)
+            return await fetch_solr(q, rows, start, _attempt + 1)
         raise RateOverflow(
             "Il sito ha temporaneamente rifiutato la richiesta per eccesso di "
             "frequenza (limitatore del servizio). Riprova tra qualche minuto."
@@ -360,10 +367,14 @@ def _format_doc(doc: dict, highlighting: dict) -> dict:
 
 
 async def _search(query: str, tipo: str, sezione: Optional[str],
-                   anno_da: Optional[int], anno_a: Optional[int], n: int) -> dict:
+                   anno_da: Optional[int], anno_a: Optional[int], n: int,
+                   pagina: int = 1) -> dict:
     q = build_query(query, tipo, sezione, anno_da, anno_a)
+    pagina = max(1, pagina)
+    rows = max(1, min(n, config.MAX_ROWS))
+    start = (pagina - 1) * rows
     try:
-        parsed = await fetch_solr(q, n)
+        parsed = await fetch_solr(q, rows, start)
     except RateOverflow as e:
         return {"errore": str(e)}
     except RuntimeError as e:
@@ -375,13 +386,26 @@ async def _search(query: str, tipo: str, sezione: Optional[str],
     response = parsed.get("response", {})
     highlighting = parsed.get("highlighting", {})
     docs = response.get("docs", [])
-    return {
-        "totale_trovati": response.get("numFound", len(docs)),
+    totale = response.get("numFound", len(docs))
+    totale_pagine = max(1, -(-totale // rows)) if rows else 1  # ceil division
+    out = {
+        "totale_trovati": totale,
+        "pagina": pagina,
+        "risultati_per_pagina": rows,
+        "totale_pagine": totale_pagine,
         "risultati": [_format_doc(d, highlighting) for d in docs],
         "nota": "L'estratto è solo un'anteprima. Per il testo integrale usa lo "
         "strumento leggi_provvedimento con il campo url_pdf: NON aprire "
         "url_pdf direttamente, non funziona fuori da questo connettore.",
     }
+    if pagina < totale_pagine:
+        out["nota_paginazione"] = (
+            f"Ci sono altri risultati oltre questa pagina (totale {totale}, "
+            f"{totale_pagine} pagine da {rows}). Per una ricerca completa, "
+            f"richiama lo stesso strumento con pagina={pagina + 1}, poi "
+            f"pagina={pagina + 2}, ecc., finché pagina < totale_pagine."
+        )
+    return out
 
 
 @mcp.tool()
@@ -437,10 +461,17 @@ async def cerca_cassazione(
     anno_da: Optional[int] = None,
     anno_a: Optional[int] = None,
     n: int = 10,
+    pagina: int = 1,
 ) -> dict:
     """Cerca sentenze/ordinanze della Corte di Cassazione (dal 2012) per
     testo libero, su SentenzeWeb (italgiure.giustizia.it/sncass), gratuito e
     senza login.
+
+    Per una ricerca ESAUSTIVA (non limitata alla prima pagina): controlla nel
+    risultato i campi "totale_trovati" e "totale_pagine". Se "pagina" <
+    "totale_pagine", richiama di nuovo questo strumento con pagina=pagina+1 e
+    così via finché non hai coperto tutte le pagine, prima di considerare la
+    ricerca completa.
 
     Args:
         query: testo da cercare (es. "licenziamento illegittimo"). Più
@@ -451,9 +482,11 @@ async def cerca_cassazione(
             Lavoro), se noto.
         anno_da: anno minimo della decisione (opzionale).
         anno_a: anno massimo della decisione (opzionale).
-        n: numero massimo di risultati (default 10, max 20).
+        n: risultati per pagina (default 10, max 20).
+        pagina: numero di pagina, a partire da 1 (default 1). Usa valori
+            successivi per scorrere oltre i primi risultati.
     """
-    return await _search(query, tipo, sezione, anno_da, anno_a, n)
+    return await _search(query, tipo, sezione, anno_da, anno_a, n, pagina)
 
 
 @mcp.tool()
@@ -461,16 +494,21 @@ async def ultime_cassazione(
     tipo: str = "entrambi",
     sezione: Optional[str] = None,
     n: int = 10,
+    pagina: int = 1,
 ) -> dict:
     """Restituisce gli ultimi provvedimenti pubblicati dalla Corte di
     Cassazione su SentenzeWeb, senza una query testuale specifica.
 
+    Per scorrere oltre i primi risultati, controlla "totale_pagine" nella
+    risposta e richiama con pagina=pagina+1, ecc.
+
     Args:
         tipo: "civile", "penale" o "entrambi" (default "entrambi").
         sezione: filtro opzionale per sezione, se noto.
-        n: numero massimo di risultati (default 10, max 20).
+        n: risultati per pagina (default 10, max 20).
+        pagina: numero di pagina, a partire da 1 (default 1).
     """
-    return await _search("", tipo, sezione, None, None, n)
+    return await _search("", tipo, sezione, None, None, n, pagina)
 
 
 async def _probe(query: str) -> None:

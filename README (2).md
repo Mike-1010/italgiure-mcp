@@ -1,6 +1,8 @@
 # Connettore MCP per SentenzeWeb (Corte di Cassazione)
 
-Strumenti esposti a Claude: `cerca_cassazione`, `ultime_cassazione`.
+Strumenti esposti a Claude: `cerca_cassazione`, `ultime_cassazione`,
+`leggi_provvedimento` (testo integrale di un provvedimento), `diagnostica_tls`
+(debug del certificato TLS del sito, non per uso normale).
 
 Interroga in tempo reale il motore di ricerca gratuito della Corte di
 Cassazione (https://www.italgiure.giustizia.it/sncass/): sentenze e
@@ -65,9 +67,19 @@ in quel caso valuteremo un provider diverso o un'altra strategia.
 
 ## Note d'uso
 - Restituisce estremi del provvedimento ed estratto con evidenziazione; il
-  testo integrale va sempre letto nel PDF collegato (versione OCR "pulita").
-- Il filtro per sezione (`sezione`) è best-effort: il campo esatto usato dal
-  sito per le sezioni non è documentato pubblicamente, verificalo con
-  qualche ricerca di prova.
+  testo integrale va sempre letto nel PDF collegato (versione OCR "pulita"),
+  tramite `leggi_provvedimento` — mai aprendo il link "url_pdf" nudo: richiede
+  sessione e header che solo questo connettore invia correttamente (il
+  gateway del sito risponde 500 altrimenti). Il download replica un flusso in
+  due passi (endpoint di preparazione OCR + attach del PDF `.clean`).
+- **Paginazione**: `cerca_cassazione` e `ultime_cassazione` accettano un
+  parametro `pagina` (default 1, `n` risultati per pagina). La risposta
+  include `totale_trovati` e `totale_pagine`: per una ricerca esaustiva
+  bisogna richiamare lo strumento con `pagina` crescente finché non si sono
+  coperte tutte le pagine (rispettando comunque il limitatore del sito).
+- Il filtro per sezione (`sezione`) è **best-effort e non ancora verificato**:
+  il campo Solr usato (`ssz`) e il formato atteso del valore non sono stati
+  confermati confrontando con una richiesta reale del sito filtrata per
+  sezione (via DevTools) — da verificare prima di fidarsene.
 - Rispetta la sensibilità del sito alla frequenza delle richieste: evita
   script che lo interrogano in loop.
