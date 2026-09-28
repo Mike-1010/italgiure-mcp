@@ -41,6 +41,13 @@ indizio di pertinenza. Cita sempre numero, sezione e data della decisione.
 Il sito ha un limitatore di frequenza severo: se una ricerca fallisce con un
 messaggio di sovraccarico, aspetta prima di riprovare invece di ripetere la
 chiamata subito.
+
+IMPORTANTE: il link "url_pdf" restituito nei risultati NON è apribile
+direttamente in un browser (il vecchio gateway del sito risponde con un
+errore 500 se non riceve gli header che solo questo connettore invia
+correttamente). Per leggere il testo integrale di un provvedimento usa
+sempre lo strumento `leggi_provvedimento` passandogli quell'url_pdf, non
+dare mai all'utente il link nudo come se fosse cliccabile.
 """
 
 mcp = FastMCP(
@@ -212,6 +219,57 @@ async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
     return parsed
 
 
+_pdf_cache: dict[str, tuple[float, bytes]] = {}
+
+
+async def fetch_pdf_bytes(url: str) -> bytes:
+    """Scarica il PDF di un provvedimento con gli stessi header (sessione +
+    Referer) che il sito richiede. Una richiesta diretta senza questi header
+    (es. incollare l'URL nel browser) fallisce con un errore del server."""
+    now = time.monotonic()
+    if url in _pdf_cache:
+        ts, data = _pdf_cache[url]
+        if now - ts < config.CACHE_TTL:
+            return data
+
+    await ensure_session()
+    client = await get_client()
+    async with _lock:
+        await _throttle()
+        try:
+            r = await client.get(url, headers={"Referer": config.SEARCH_PAGE_URL})
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"Impossibile scaricare il PDF: {e}") from e
+
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Il sito ha risposto con errore {r.status_code} nello scaricare il PDF "
+            "(il provvedimento potrebbe non essere più disponibile a quel link)."
+        )
+    content = r.content
+    if not content.startswith(b"%PDF"):
+        raise RuntimeError(
+            "La risposta non è un PDF valido (probabile pagina di errore del sito "
+            "invece del documento)."
+        )
+    _pdf_cache[url] = (now, content)
+    return content
+
+
+def _extract_pdf_text(data: bytes, max_chars: int) -> tuple[str, bool]:
+    import io
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    parts = [page.extract_text() or "" for page in reader.pages]
+    text = "\n".join(parts).strip()
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars]
+    return text, truncated
+
+
 def _pdf_url(doc: dict) -> Optional[str]:
     filename = doc.get("filename")
     kind = doc.get("kind")
@@ -271,7 +329,9 @@ async def _search(query: str, tipo: str, sezione: Optional[str],
     return {
         "totale_trovati": response.get("numFound", len(docs)),
         "risultati": [_format_doc(d, highlighting) for d in docs],
-        "nota": "Il testo integrale è nel PDF collegato; l'estratto è solo un'anteprima.",
+        "nota": "L'estratto è solo un'anteprima. Per il testo integrale usa lo "
+        "strumento leggi_provvedimento con il campo url_pdf: NON aprire "
+        "url_pdf direttamente, non funziona fuori da questo connettore.",
     }
 
 
@@ -285,6 +345,39 @@ async def diagnostica_tls() -> dict:
     except Exception as e:
         return {"errore_diagnostica": f"{type(e).__name__}: {e}"}
     return info
+
+
+@mcp.tool()
+async def leggi_provvedimento(url_pdf: str, max_caratteri: int = 20000) -> dict:
+    """Scarica il PDF di un provvedimento (campo "url_pdf" di un risultato di
+    cerca_cassazione/ultime_cassazione) e ne estrae il testo integrale.
+
+    Usa SEMPRE questo strumento per leggere il testo integrale: il link
+    "url_pdf" non è apribile direttamente in un browser o con un semplice
+    fetch, perché il sito richiede una sessione e un header Referer che solo
+    questo connettore invia correttamente.
+
+    Args:
+        url_pdf: il link "url_pdf" restituito da un risultato di ricerca.
+        max_caratteri: lunghezza massima del testo restituito (default 20000;
+            i provvedimenti lunghi vengono troncati, indicato nel campo
+            "troncato" della risposta).
+    """
+    try:
+        data = await fetch_pdf_bytes(url_pdf)
+        text, truncated = await asyncio.to_thread(_extract_pdf_text, data, max_caratteri)
+    except RateOverflow as e:
+        return {"errore": str(e)}
+    except Exception as e:
+        detail = f" [tls_fix: {_tls_fix_error}]" if _tls_fix_error else ""
+        return {"errore": f"{type(e).__name__}: {e}{detail}"}
+
+    if not text:
+        return {
+            "errore": "PDF scaricato correttamente ma senza testo estraibile "
+            "(probabile scansione priva di livello OCR)."
+        }
+    return {"testo": text, "troncato": truncated}
 
 
 @mcp.tool()
