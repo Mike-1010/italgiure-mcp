@@ -19,6 +19,9 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 import config
+import tls_fix
+
+_HOSTNAME = config.BASE.split("//", 1)[1].split("/", 1)[0]
 
 INSTRUCTIONS = """\
 Accesso in tempo reale a SentenzeWeb, il motore di ricerca gratuito della
@@ -48,11 +51,8 @@ mcp = FastMCP(
     streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
 )
 
-_client = httpx.AsyncClient(
-    headers={"User-Agent": config.USER_AGENT},
-    timeout=config.TIMEOUT,
-    follow_redirects=True,
-)
+_client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
 _lock = asyncio.Lock()
 _last_request = 0.0
 _cache: dict[str, tuple[float, dict]] = {}
@@ -62,6 +62,38 @@ _session_ready_at = 0.0
 
 class RateOverflow(Exception):
     """Il sito ha rifiutato la richiesta per eccesso di frequenza."""
+
+
+_tls_fix_error: Optional[str] = None
+_tls_fix_hops: int = -1
+
+
+async def get_client() -> httpx.AsyncClient:
+    """Client HTTP condiviso, creato al primo utilizzo con un SSLContext che
+    include gli eventuali certificati intermedi mancanti (vedi tls_fix.py)."""
+    global _client, _tls_fix_error, _tls_fix_hops
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        if _client is not None:
+            return _client
+        try:
+            ssl_ctx, hops = await tls_fix.build_ssl_context_diag(_HOSTNAME)
+            verify = ssl_ctx
+            _tls_fix_hops = hops
+        except Exception as e:
+            # Non siamo riusciti a ricostruire la catena: ripieghiamo sulla
+            # verifica standard (certifi), ma teniamo traccia del motivo per
+            # poterlo diagnosticare (vedi diagnostica_tls()).
+            _tls_fix_error = f"{type(e).__name__}: {e}"
+            verify = True
+        _client = httpx.AsyncClient(
+            headers={"User-Agent": config.USER_AGENT},
+            timeout=config.TIMEOUT,
+            follow_redirects=True,
+            verify=verify,
+        )
+        return _client
 
 
 async def _throttle() -> None:
@@ -80,9 +112,16 @@ async def ensure_session() -> None:
     async with _session_lock:
         if time.monotonic() - _session_ready_at < config.SESSION_TTL:
             return
+        client = await get_client()
         async with _lock:
             await _throttle()
-            r = await _client.get(config.SEARCH_PAGE_URL)
+            try:
+                r = await client.get(config.SEARCH_PAGE_URL)
+            except Exception as e:
+                detail = f" [tls_fix: {_tls_fix_error}]" if _tls_fix_error else ""
+                raise RuntimeError(
+                    f"Impossibile connettersi a italgiure.giustizia.it: {e}{detail}"
+                ) from e
         if r.status_code == 200:
             _session_ready_at = time.monotonic()
 
@@ -140,10 +179,11 @@ async def fetch_solr(q: str, rows: int, _attempt: int = 0) -> dict:
         "hl.q": q,
     }
 
+    client = await get_client()
     async with _lock:
         await _throttle()
         try:
-            r = await _client.post(
+            r = await client.post(
                 config.SELECT_URL,
                 data=data,
                 headers={"Referer": config.SEARCH_PAGE_URL},
@@ -212,6 +252,9 @@ async def _search(query: str, tipo: str, sezione: Optional[str],
         return {"errore": str(e)}
     except RuntimeError as e:
         return {"errore": str(e)}
+    except Exception as e:
+        detail = f" [tls_fix: {_tls_fix_error}]" if _tls_fix_error else ""
+        return {"errore": f"{type(e).__name__}: {e}{detail}"}
 
     response = parsed.get("response", {})
     highlighting = parsed.get("highlighting", {})
@@ -221,6 +264,18 @@ async def _search(query: str, tipo: str, sezione: Optional[str],
         "risultati": [_format_doc(d, highlighting) for d in docs],
         "nota": "Il testo integrale è nel PDF collegato; l'estratto è solo un'anteprima.",
     }
+
+
+@mcp.tool()
+async def diagnostica_tls() -> dict:
+    """Strumento di servizio: verifica se il problema di certificato TLS del
+    sito è stato risolto e, in caso contrario, spiega perché. Da usare solo
+    per debug del connettore, non per ricerche vere."""
+    try:
+        info = await tls_fix.diagnose(_HOSTNAME)
+    except Exception as e:
+        return {"errore_diagnostica": f"{type(e).__name__}: {e}"}
+    return info
 
 
 @mcp.tool()
