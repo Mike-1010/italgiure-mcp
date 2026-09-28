@@ -217,7 +217,16 @@ def _pdf_url(doc: dict) -> Optional[str]:
     kind = doc.get("kind")
     if not filename or not kind:
         return None
-    return config.PDF_URL_TEMPLATE.format(db=kind, path=filename)
+    # Il campo "filename" può essere una lista di percorsi (es. originale +
+    # versione OCR "pulita"): preferiamo quello con ".clean.pdf" se presente,
+    # altrimenti il primo disponibile.
+    if isinstance(filename, list):
+        if not filename:
+            return None
+        path = next((p for p in filename if "clean" in p), filename[0])
+    else:
+        path = filename
+    return config.PDF_URL_TEMPLATE.format(db=kind, path=path)
 
 
 def _format_doc(doc: dict, highlighting: dict) -> dict:
