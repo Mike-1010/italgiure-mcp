@@ -143,7 +143,7 @@ def _escape(term: str) -> str:
     return re.sub(r'(["\\])', r"\\\1", term.strip())
 
 
-def build_query(query: str, tipo: str, sezione: Optional[str],
+def build_query(query: str, tipo: str,
                  anno_da: Optional[int], anno_a: Optional[int]) -> str:
     query = (query or "").strip()
     if not query:
@@ -159,8 +159,6 @@ def build_query(query: str, tipo: str, sezione: Optional[str],
     kind_clause = config.KIND_FILTERS.get(tipo, config.KIND_FILTERS["entrambi"])
     clauses = [text_clause, kind_clause]
 
-    if sezione:
-        clauses.append(f'ssz:"{_escape(sezione)}"')
     if anno_da or anno_a:
         lo = anno_da or "*"
         hi = anno_a or "*"
@@ -366,10 +364,10 @@ def _format_doc(doc: dict, highlighting: dict) -> dict:
     return {k: v for k, v in out.items() if v not in (None, "", [])}
 
 
-async def _search(query: str, tipo: str, sezione: Optional[str],
+async def _search(query: str, tipo: str,
                    anno_da: Optional[int], anno_a: Optional[int], n: int,
                    pagina: int = 1) -> dict:
-    q = build_query(query, tipo, sezione, anno_da, anno_a)
+    q = build_query(query, tipo, anno_da, anno_a)
     pagina = max(1, pagina)
     rows = max(1, min(n, config.MAX_ROWS))
     start = (pagina - 1) * rows
@@ -457,7 +455,6 @@ async def leggi_provvedimento(url_pdf: str, max_caratteri: int = 20000) -> dict:
 async def cerca_cassazione(
     query: str,
     tipo: str = "entrambi",
-    sezione: Optional[str] = None,
     anno_da: Optional[int] = None,
     anno_a: Optional[int] = None,
     n: int = 10,
@@ -477,22 +474,21 @@ async def cerca_cassazione(
         query: testo da cercare (es. "licenziamento illegittimo"). Più
             parole vengono cercate come prossimità, non serve mettere le
             virgolette.
-        tipo: "civile", "penale" o "entrambi" (default "entrambi").
-        sezione: filtro opzionale per sezione (best-effort, es. "L" per
-            Lavoro), se noto.
+        tipo: "civile", "penale" o "entrambi" (default "entrambi"). Non
+            esiste un filtro per singola sezione: la distinzione disponibile
+            è solo civile/penale/entrambi.
         anno_da: anno minimo della decisione (opzionale).
         anno_a: anno massimo della decisione (opzionale).
         n: risultati per pagina (default 10, max 20).
         pagina: numero di pagina, a partire da 1 (default 1). Usa valori
             successivi per scorrere oltre i primi risultati.
     """
-    return await _search(query, tipo, sezione, anno_da, anno_a, n, pagina)
+    return await _search(query, tipo, anno_da, anno_a, n, pagina)
 
 
 @mcp.tool()
 async def ultime_cassazione(
     tipo: str = "entrambi",
-    sezione: Optional[str] = None,
     n: int = 10,
     pagina: int = 1,
 ) -> dict:
@@ -504,15 +500,14 @@ async def ultime_cassazione(
 
     Args:
         tipo: "civile", "penale" o "entrambi" (default "entrambi").
-        sezione: filtro opzionale per sezione, se noto.
         n: risultati per pagina (default 10, max 20).
         pagina: numero di pagina, a partire da 1 (default 1).
     """
-    return await _search("", tipo, sezione, None, None, n, pagina)
+    return await _search("", tipo, None, None, n, pagina)
 
 
 async def _probe(query: str) -> None:
-    res = await _search(query, "entrambi", None, None, None, 5)
+    res = await _search(query, "entrambi", None, None, 5)
     import json
     print(json.dumps(res, ensure_ascii=False, indent=2))
 

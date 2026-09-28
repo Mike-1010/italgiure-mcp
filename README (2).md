@@ -77,9 +77,10 @@ in quel caso valuteremo un provider diverso o un'altra strategia.
   include `totale_trovati` e `totale_pagine`: per una ricerca esaustiva
   bisogna richiamare lo strumento con `pagina` crescente finché non si sono
   coperte tutte le pagine (rispettando comunque il limitatore del sito).
-- Il filtro per sezione (`sezione`) è **best-effort e non ancora verificato**:
-  il campo Solr usato (`ssz`) e il formato atteso del valore non sono stati
-  confermati confrontando con una richiesta reale del sito filtrata per
-  sezione (via DevTools) — da verificare prima di fidarsene.
+- **Nessun filtro per singola sezione**: non è uno strumento utile per questo
+  uso (le ricerche non si fanno per sezione della Cassazione). L'unica
+  distinzione disponibile è `tipo` = "civile" / "penale" / "entrambi". La
+  sezione del provvedimento (es. Lavoro, Sezioni Unite) resta comunque
+  visibile come informazione nei risultati, quando disponibile.
 - Rispetta la sensibilità del sito alla frequenza delle richieste: evita
   script che lo interrogano in loop.
